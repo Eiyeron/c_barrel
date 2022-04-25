@@ -1,0 +1,5 @@
+name=Barrel
+author=Eiyeron
+description=A sketch mimicking Super Castlevania IV's barrel effect
+bundleID=me.retroactive.barrel
+imagePath=images/card

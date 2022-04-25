@@ -31,6 +31,10 @@ project(${PLAYDATE_GAME_NAME} C ASM)
 
 set(PROJECT_SRC src/main.c)
 if (TOOLCHAIN STREQUAL "armgcc")
+	# Coming from https://devforum.play.date/t/doom-on-playdate/852/27
+	# On Windows I have linking issues revolving around missing libc symbols.
+	# I hope this will fix the issue without breaking everything.
+	add_link_options(-specs=nano.specs -specs=nosys.specs)
 	add_executable(${PLAYDATE_GAME_DEVICE} ${SDK}/C_API/buildsupport/setup.c ${PROJECT_SRC})
 else()
 	add_library(${PLAYDATE_GAME_NAME} SHARED src/main.c ${PROJECT_SRC})
