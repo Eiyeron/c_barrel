@@ -12,6 +12,7 @@ LCDBitmap* gradient;
 
 int gradient_width = 0;
 int gradient_height = 0;
+int gradient_y = 0;
 
 static char error_message[256] = "";
 
@@ -47,7 +48,7 @@ static bool init(PlaydateAPI* pd)
         return false;
     }
 
-    gradient = pd->graphics->loadBitmap("gradient_bayer_big", &err);
+    gradient = pd->graphics->loadBitmap("gradient", &err);
     if (gradient == NULL)
     {
         register_error(pd, err);
@@ -55,6 +56,7 @@ static bool init(PlaydateAPI* pd)
     }
 
     pd->graphics->getBitmapData(gradient, &gradient_width, &gradient_height, NULL, NULL, NULL);
+    gradient_y = (LCD_ROWS - gradient_height) / 2;
 
     // Precomputing the cosine effect to improve performance
 
@@ -79,7 +81,8 @@ static int update(void* userdata)
     uint8_t* data;
     pd->graphics->getBitmapData(bitmap, &width, &height, &rowbytes, &mask, &data);
 
-    uint8_t* buffer = pd->graphics->getFrame();
+    // Assuming that the frame buffer is aligned on 4bytes.
+    uint32_t* buffer = (uint32_t*)pd->graphics->getFrame();
 
     float t = pd->system->getElapsedTime();
     // Just to play around.
@@ -95,12 +98,16 @@ static int update(void* userdata)
         y_offset = height + y_offset;
     }
 
-    float x_offset = t * 60.f;
 
     // Use the crank to scroll if it's undocked, it's funnier this way.
+    float x_offset;
     if (!pd->system->isCrankDocked())
     {
         x_offset = pd->system->getCrankAngle() / 360.f * width;
+    }
+    else
+    {
+        x_offset = t * 60.f;
     }
 
     for (int y = 0; y < 240; ++y)
@@ -109,8 +116,8 @@ static int update(void* userdata)
         // The scale-based offset makes the effect centered.
         // Try running without the offset, it'll look like it's centered on the
         // left-most pixel column.
-        float scale = tunnel_profile[y];
-        float base_x_offset = x_offset - scale * 200.f;
+        const float scale = tunnel_profile[y];
+        const float base_x_offset = x_offset - scale * 200.f;
 
 
         // handling negative offset.
@@ -120,37 +127,10 @@ static int update(void* userdata)
             input_x_offset = width + input_x_offset;
         }
 
-        // I don't know if it's faster than modf(x_offset, 1.0f), but I expect so.
-        float frac = input_x_offset - truncf(input_x_offset);
-
         uint32_t input_bit_pointer = (uint32_t)(input_x_offset) % 8;
         uint32_t input_byte_offset = (uint32_t)(input_x_offset) / 8;
 
-        int input_y = (int)(y_offset + y) % height;
-        // Precompute the adress offset of the input's row.
-        // Note that if I don't precompute it, it turns from a simple add to a MAC,
-        // which are supposedly 1-cycle on Cortex-M7, so it might just be a waste of
-        // a register.
-        int input_y_row_offset = input_y * rowbytes;
-        uint8_t* input_pointer = &data[input_y_row_offset + input_byte_offset];
-        uint32_t input_byte = *input_pointer;
 
-        uint8_t* output_pointer = &buffer[y * LCD_ROWSIZE];
-        // Temporary byte to work on until I blit it directly to the framebuffer.
-        // Might be purely useless, maybe optimized out. I need to tune this too.
-        uint32_t output_acc = 0;
-
-        // This could be split into double for loops instead,
-        // for(x; x < LCD_COLUMNS; x+=8) for(bit; bit < 8; ++bit)
-        uint32_t written_bits = 0;
-
-        // A runtime hint for the CPU to load the next cacheline-width data at the adress.
-        // I'm not sure if it has a performance impact, that's one of the things I want to check
-        // once I have the hardware to test on.
-#ifdef TARGET_PLAYDATE
-        __builtin_prefetch(output_pointer);
-        __builtin_prefetch(output_pointer + 32);
-#endif
         // 16.16 fixed point instead of floating point.
         // It should work as good here as floating point as precision loss would be marginal
         // and the number of operation wouldn't make the loss stack too much.
@@ -172,57 +152,79 @@ static int update(void* userdata)
         // Float -> Fixed : assume that the operation won't cause precision loss.
         // The 32 bit mantissa doesn't fit a whole uint32_t, so if the values are too big,
         // the result will be incorrect;
-		uint32_t frac_fixed = (uint32_t)(frac * 65536.f);
-		uint32_t scale_fixed = (uint32_t)(scale * 65536.f);
-        for (int x = 0; x < LCD_COLUMNS; ++x)
+        const float frac = input_x_offset - truncf(input_x_offset);
+        uint32_t frac_fixed = (uint32_t)(frac * 65536.f);
+        const uint32_t scale_fixed = (uint32_t)(scale * 65536.f);
+
+
+        int input_y = (int)(y_offset + y) % height;
+        // Precompute the adress offset of the input's row.
+        // Note that if I don't precompute it, it turns from a simple add to a MAC,
+        // which are supposedly 1-cycle on Cortex-M7, so it might just be a waste of
+        // a register.
+        const int input_y_row_offset = input_y * rowbytes;
+        uint8_t* input_pointer = &data[input_y_row_offset + input_byte_offset];
+        uint32_t input_byte = *input_pointer;
+
+        uint32_t* output_pointer = (&buffer[y * (LCD_ROWSIZE/4)]);
+
+        // A runtime hint for the CPU to load the next cacheline-width data at the adress.
+        // I'm not sure if it has a performance impact, that's one of the things I want to check
+        // once I have the hardware to test on.
+#ifdef TARGET_PLAYDATE
+        __builtin_prefetch(output_pointer);
+        __builtin_prefetch(output_pointer + 32);
+#endif
+
+        for (int x = 0; x < LCD_ROWSIZE/4; ++x)
         {
-
-            // If the input must be advanced
-            if (frac_fixed >= 0x0001'0000)
+            uint32_t output_value = 0;
+            uint32_t current_bit = (input_byte & (0x10)) != 0;
+            for (int bit = 0; bit < 32; ++bit)
             {
-                uint32_t integer_part = frac_fixed >> 16;
-                input_bit_pointer += integer_part;
-                frac_fixed &= 0xFFFF;
-                // The current input byte is through, fetch the next one.
-                if (input_bit_pointer >= 8)
+                // If the input must be advanced
+                if (frac_fixed >= 0x00010000)
                 {
-                    // >>3 and & 7 for the two next operations but I assume that
-                    // the compiler is smart enough to figure it out.
-                    //
-                    // Update: GCC is smart enough to do the change.
-                    uint32_t offset = input_bit_pointer / 8;
-                    input_bit_pointer %= 8;
-                    input_byte_offset = (input_byte_offset + offset) % rowbytes;
-                    input_pointer = &data[input_y_row_offset + input_byte_offset];
-                    input_byte = *input_pointer;
+                    const uint32_t integer_part = frac_fixed >> 16;
+                    input_bit_pointer += integer_part;
+                    frac_fixed &= 0xFFFF;
+                    // The current input byte is through, fetch the next one.
+                    if (input_bit_pointer >= 8)
+                    {
+                        // >>3 and & 7 for the two next operations but I assume that
+                        // the compiler is smart enough to figure it out.
+                        //
+                        // Update: GCC is smart enough to do the change.
+                        const uint32_t offset = input_bit_pointer / 8;
+                        input_bit_pointer %= 8;
+                        input_byte_offset = (input_byte_offset + offset) % rowbytes;
+                        input_pointer = &data[input_y_row_offset + input_byte_offset];
+                        input_byte = *input_pointer;
+                    }
+                    // From the highest bit to the lowest.
+                    const uint32_t bit_offset = 7 - input_bit_pointer;
+                    current_bit = (input_byte & (1 << bit_offset)) != 0;
                 }
+
+                // Output data seek and write.
+                output_value <<= 1;
+                output_value |= current_bit;
+                frac_fixed += scale_fixed;
             }
-
-            // Output data seek and write.
-            // Tricky bit : Because the data is aligned as MSB data, we must take care of the way
-            // we collect and apply bits. From left to right => from the MSB to the LSB.
-            uint32_t selected_bit = (input_byte & (1 << (7 - input_bit_pointer))) != 0;
-
-            // TODO Does this works faster than this weird operation?
-            // It should work the same, pushing the bits from the biggest to the smallest
-            // but we'retalking about a few cycles of difference.
-            /*
-            output_acc <<= 1;
-            output_acc |= selected_bit;
-            */
-            output_acc |= selected_bit << (7 - written_bits);
-            ++written_bits;
-
             // Write to the screen once we got a full byte.
-            if (written_bits == 8)
-            {
-                *output_pointer = (uint8_t)output_acc;
-                ++output_pointer;
-                output_acc = 0;
-                written_bits = 0;
-            }
-            frac_fixed += scale_fixed;
 
+            // The system being in little endian, the byte order looks like this
+            // RAM# | 0 | 1 | 2 | 3
+            // -----+---+---+---+---
+            // INT# | 3 | 2 | 1 | 0
+            // But we packed the bits like if we were in big endian, so we have to swap
+            // the bits.
+#ifdef TARGET_PLAYDATE
+            *output_pointer = __builtin_bswap32(output_value);
+#else
+            *output_pointer = _byteswap_ulong(output_value);
+#endif
+            ++output_pointer;
         }
     }
 
@@ -230,20 +232,15 @@ static int update(void* userdata)
     // This could be instead a mask applied on the drawing part in the barrel loop
     // but I wanted to see how some of the gradients would look without having to
     // program them.
-    // I bundled a few different gradients if you want to test them.
-    if (gradient_width != 0)
+    for (int x = 0; x < LCD_COLUMNS; x += gradient_width)
     {
-        for (int x = 0; x < LCD_COLUMNS; x += gradient_width)
-        {
-            pd->graphics->drawBitmap(gradient, x, (LCD_ROWS - gradient_height) / 2, kBitmapUnflipped);
-        }
+        pd->graphics->drawBitmap(gradient, x, gradient_y, kBitmapUnflipped);
     }
 
     // Because there's not a single graphics routine used other than the draw fps one
     // we have to declare we want the whole screen updated.
     pd->graphics->markUpdatedRows(0, LCD_ROWS - 1);
     
-    pd->system->drawFPS(0, 0);
     return 1;
 }
 
