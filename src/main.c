@@ -151,15 +151,38 @@ static int update(void* userdata)
         __builtin_prefetch(output_pointer);
         __builtin_prefetch(output_pointer + 32);
 #endif
+        // 16.16 fixed point instead of floating point.
+        // It should work as good here as floating point as precision loss would be marginal
+        // and the number of operation wouldn't make the loss stack too much.
+
+        // The idea behind fixed point is to use the higher part of the integer type
+        // as the integer part and the lower part as the fractional part of a number.
+        // 0xIIIIFFFF
+        // So to convert from or into an integer, you have to keep the highest part
+        // thus binary shift them by 16 in one or the other direction depending of the
+        // conversion.
+        // Fixed point math is a bit tricky in some operation but we're only using
+        // addition, substraction and fract() (which sums up to keeping the fractional bytes)
+        // so the conversion is trivial.
+        //
+        // The only downside is that extreme scaling cases will now provide invalid results
+        // but do we really want to deal with those?
+        // for a good chunk of the scaling ranges while giving more precision for 
+
+        // Float -> Fixed : assume that the operation won't cause precision loss.
+        // The 32 bit mantissa doesn't fit a whole uint32_t, so if the values are too big,
+        // the result will be incorrect;
+		uint32_t frac_fixed = (uint32_t)(frac * 65536.f);
+		uint32_t scale_fixed = (uint32_t)(scale * 65536.f);
         for (int x = 0; x < LCD_COLUMNS; ++x)
         {
 
             // If the input must be advanced
-            if (frac >= 1)
+            if (frac_fixed >= 0x0001'0000)
             {
-                float integer_part = truncf(frac);
-                input_bit_pointer += (uint32_t)integer_part;
-                frac -= integer_part;
+                uint32_t integer_part = frac_fixed >> 16;
+                input_bit_pointer += integer_part;
+                frac_fixed &= 0xFFFF;
                 // The current input byte is through, fetch the next one.
                 if (input_bit_pointer >= 8)
                 {
@@ -198,7 +221,7 @@ static int update(void* userdata)
                 output_acc = 0;
                 written_bits = 0;
             }
-            frac += scale;
+            frac_fixed += scale_fixed;
 
         }
     }
