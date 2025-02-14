@@ -77,7 +77,7 @@ static int update(void* userdata)
 
     int width, height;
     int rowbytes;
-    int mask;
+    uint8_t* mask;
     uint8_t* data;
     pd->graphics->getBitmapData(bitmap, &width, &height, &rowbytes, &mask, &data);
 
